@@ -1555,13 +1555,14 @@ const DEFAULT_STATE = () => ({
   daily: {date: "", xp: 0}, streak: {count: 0, best: 0, last: ""}, hist: {},
   lessons: {}, words: {}, letters: {}, badges: {},
   stats: {answers: 0, correct: 0, listen: 0, spoken: 0, traced: 0, dictated: 0},
-  settings: {voice: "app", slow: false, showPron: true, showStress: true, kb: "abc", sfx: true, theme: "auto", devVoice: "", flashDir: "ru"}
+  settings: {voice: "auto", voiceSet: false, slow: false, showPron: true, showStress: true, kb: "abc", sfx: true, theme: "auto", devVoice: "", flashDir: "ru"}
 });
 function migrate(o) {
   const d = DEFAULT_STATE();
   if (!o || typeof o !== "object") return d;
   const out = Object.assign(d, o);
   out.settings = Object.assign(DEFAULT_STATE().settings, o.settings || {});
+  if (out.settings.voice === "app" && !out.settings.voiceSet) out.settings.voice = "auto"; // antes la voz de la app era la opción por defecto
   out.stats = Object.assign(DEFAULT_STATE().stats, o.stats || {});
   out.daily = Object.assign({date: "", xp: 0}, o.daily || {});
   out.streak = Object.assign({count: 0, best: 0, last: ""}, o.streak || {});
@@ -1722,6 +1723,7 @@ const Audio2 = {
     if (this.unlocked) return; this.unlocked = true;
     const a = this.element();
     try { a.src = SILENT; const p = a.play(); if (p && p.catch) p.then(() => a.pause()).catch(() => {}); } catch (e) {}
+    try { if ("speechSynthesis" in window) { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } } catch (e) {} // iOS: desbloquea la voz del dispositivo
     SFX.ensure();
   },
   async url(text, voice) {
@@ -1748,8 +1750,14 @@ const Audio2 = {
     const token = this.seq;
     const btn = opt.btn;
     const slow = opt.slow ?? S.settings.slow;
-    const useDevice = S.settings.voice === "device" && TTS.ready();
-    if (!useDevice && this.has(text, opt.voice)) {
+    const dev = this.deviceVoiceFor(text, opt.voice);
+    if (dev) {
+      if (btn) btn.classList.add("playing");
+      const r = await TTS.say(text, {slow, voice: dev});
+      if (btn) btn.classList.remove("playing");
+      if (r || token !== this.seq) return r;
+    }
+    if (this.has(text, opt.voice)) {
       try {
         if (btn) btn.classList.add("loading");
         const u = await this.url(text, opt.voice);
@@ -1778,6 +1786,18 @@ const Audio2 = {
     if (!r && !this.warned) { this.warned = true; toast("No se pudo reproducir el audio. Revisa el volumen o tu conexión."); }
     return r;
   },
+  /* ¿Qué voz del dispositivo usar? null = la voz de la app.
+     Las palabras cuyo significado cambia con el acento (за́мок / замо́к) siempre usan
+     la voz de la app, que pronuncia el acento marcado. */
+  deviceVoiceFor(text, voice) {
+    const mode = S.settings.voice;
+    if (mode === "app" || !("speechSynthesis" in window) || stressCritical(text)) return null;
+    const male = voice === "m";
+    const v = mode === "device" ? TTS.pickVoice(male) : TTS.goodVoice(male);
+    if (!v) return null;
+    if (male && !TTS.isMale(v) && this.has(text, "m")) return null; // mejor la voz masculina de la app
+    return v;
+  },
   /* Reproduce varios textos seguidos; cualquier stop() la interrumpe */
   async playSeq(items, onStep) {
     this.stop(); const my = this.chain;
@@ -1793,23 +1813,44 @@ const Audio2 = {
     return my === this.chain;
   }
 };
-/* Voz del dispositivo (respaldo) */
+/* Palabras que cambian de significado según el acento (за́мок / замо́к) */
+let _critical = null;
+function stressCritical(text) {
+  if (!_critical) {
+    const seen = {};
+    Object.keys(AUDIO_INDEX).forEach(k => String(k).replace(/^M:/, "").toLowerCase().split(/[^а-яё']+/).forEach(w => {
+      if (!w.includes("'")) return; const p = w.replace(/'/g, ""); (seen[p] = seen[p] || new Set()).add(w.indexOf("'"));
+    }));
+    _critical = new Set(Object.keys(seen).filter(p => seen[p].size > 1));
+  }
+  return String(text).toLowerCase().replace(/'/g, "").split(/[^а-яё]+/).some(w => _critical.has(w));
+}
+/* Voz del dispositivo */
 const TTS = {
   voices: [],
   init() {
     if (!("speechSynthesis" in window)) return;
-    const load = () => { try { this.voices = speechSynthesis.getVoices().filter(v => /^ru([-_]|$)/i.test(v.lang)); } catch (e) {} };
+    const load = () => { try { const n = this.voices.length; this.voices = speechSynthesis.getVoices().filter(v => /^ru([-_]|$)/i.test(v.lang)); if (this.voices.length !== n) document.dispatchEvent(new Event("tts-voices")); } catch (e) {} };
     load();
     try { speechSynthesis.addEventListener("voiceschanged", load); } catch (e) {}
     let n = 0; const t = setInterval(() => { load(); if (this.voices.length || ++n > 20) clearInterval(t); }, 300);
   },
   ready() { return "speechSynthesis" in window && this.voices.length > 0; },
-  pickVoice() {
+  isMale(v) { return /yuri|pavel|dmitr|maxim|aleksandr|alexand|ivan|artem|sergey|male|мужск/i.test(v.name + " " + v.voiceURI) && !/female/i.test(v.name); },
+  /* Voces de buena calidad: las «mejoradas» o «premium» de Apple, las naturales de Microsoft y las de Google o Android */
+  isGood(v) { const s = v.name + " " + v.voiceURI; return /enhanced|premium|natural|neural|google|siri/i.test(s) || (/android/i.test(navigator.userAgent) && !/compact/i.test(s)); },
+  rank(v, male) { return (this.isGood(v) ? 10 : 0) + (/premium/i.test(v.voiceURI + v.name) ? 3 : 0) + (male === this.isMale(v) ? 4 : 0) + (/milena|yuri/i.test(v.name) ? 1 : 0); },
+  pickVoice(male) {
     if (!this.voices.length) return null;
-    const pref = S.settings.devVoice && this.voices.find(v => v.voiceURI === S.settings.devVoice);
+    const pref = !male && S.settings.devVoice && this.voices.find(v => v.voiceURI === S.settings.devVoice);
     if (pref) return pref;
-    const rank = v => (/google|neural|natural|premium|enhanced/i.test(v.name) ? 3 : 0) + (/milena|yuri|katya|irina|dariya|svetlana|dmitry|pavel/i.test(v.name) ? 1 : 0);
-    return this.voices.slice().sort((a, b) => rank(b) - rank(a))[0];
+    return this.voices.slice().sort((a, b) => this.rank(b, !!male) - this.rank(a, !!male))[0];
+  },
+  goodVoice(male) {
+    const good = this.voices.filter(v => this.isGood(v));
+    if (!good.length) return null;
+    const pref = !male && S.settings.devVoice && good.find(v => v.voiceURI === S.settings.devVoice);
+    return pref || good.sort((a, b) => this.rank(b, !!male) - this.rank(a, !!male))[0];
   },
   stop() { try { if ("speechSynthesis" in window) speechSynthesis.cancel(); } catch (e) {} },
   say(text, opt = {}) {
@@ -1817,7 +1858,7 @@ const TTS = {
       if (!("speechSynthesis" in window)) return res(false);
       try {
         const u = new SpeechSynthesisUtterance(plainRu(text));
-        u.lang = "ru-RU"; const v = this.pickVoice(); if (v) u.voice = v;
+        u.lang = "ru-RU"; const v = opt.voice || this.pickVoice(); if (v) u.voice = v;
         u.rate = opt.slow ? 0.65 : 0.92;
         let fin = false; const done = x => { if (!fin) { fin = true; res(x); } };
         u.onend = () => done(true); u.onerror = () => done(false);
@@ -3196,7 +3237,7 @@ R_.ajustes = {title: "Ajustes", parent: "inicio", render(_, main) {
   const pg = el(`<div class="page">
     <div class="card section"><h2>Tu nombre</h2><div id="name-card"></div></div>
     <div class="card">
-      <div class="set-row"><div class="s-txt"><b>Voz</b><span>La voz de la app funciona en todos los dispositivos. La del dispositivo depende de tu teléfono o computadora.</span></div>${seg("voice", [["app", "Voz de la app"], ["device", "Voz del dispositivo"]])}</div>
+      <div class="set-row"><div class="s-txt"><b>Voz</b><span>«Automática» usa la mejor voz rusa de tu dispositivo (por ejemplo, Milena mejorada en el iPad) y, si no hay una buena, la voz de la app.</span><span id="voice-now" style="display:block;margin-top:4px"></span></div>${seg("voice", [["auto", "Automática"], ["app", "Voz de la app"], ["device", "Voz del dispositivo"]])}</div>
       <div class="set-row" id="dev-voices" hidden><div class="s-txt"><b>Voz rusa del dispositivo</b><span id="dev-v-desc"></span></div><select id="dev-v" class="text-in" style="max-width:240px"></select></div>
       <div class="set-row"><div class="s-txt"><b>Velocidad</b><span>Para empezar, la voz lenta ayuda mucho</span></div>${seg("slow", [["false", "Normal"], ["true", "Lenta"]])}</div>
       <div class="set-row"><div class="s-txt"><b>Probar la voz</b><span lang="ru">${ruH("Приве'т! Как дела'?")}</span></div>${sayBtn("Приве'т! Как дела'?")}</div>
@@ -3224,26 +3265,30 @@ R_.ajustes = {title: "Ajustes", parent: "inicio", render(_, main) {
       S.settings[k] = v; Store.touch();
       $$(`[data-set="${k}"]`, pg).forEach(x => x.classList.toggle("on", x === b));
       if (k === "theme") { App.themeTouched = true; applyTheme(); }
-      if (k === "voice") syncVoices();
+      if (k === "voice") { S.settings.voiceSet = true; Store.touch(); syncVoices(); }
     }
     const g = e.target.closest("[data-goal]"); if (g) { S.goal = +g.dataset.goal; Store.touch(); $$("[data-goal]", pg).forEach(x => x.classList.toggle("on", x === g)); }
     const s = e.target.closest("[data-sw]"); if (s) { const k = s.dataset.sw; S.settings[k] = !S.settings[k]; s.setAttribute("aria-checked", S.settings[k]); Store.touch(); }
   });
   const syncVoices = () => {
     const row = $("#dev-voices"), sel = $("#dev-v");
-    row.hidden = S.settings.voice !== "device";
+    const now = $("#voice-now");
+    if (now) { const v = S.settings.voice === "app" ? null : (S.settings.voice === "device" ? TTS.pickVoice() : TTS.goodVoice()); now.innerHTML = `Ahora suena: <b>${v ? esc(v.name) : "voz de la app"}</b>`; }
+    row.hidden = S.settings.voice === "app";
     if (!TTS.ready()) { $("#dev-v-desc").textContent = "Este dispositivo no tiene una voz rusa. Se usará la voz de la app."; sel.hidden = true; return; }
     sel.hidden = false; $("#dev-v-desc").textContent = "Elige la que más te guste";
     sel.innerHTML = TTS.voices.map(v => `<option value="${esc(v.voiceURI)}" ${TTS.pickVoice() === v ? "selected" : ""}>${esc(v.name)}</option>`).join("");
-    sel.onchange = () => { S.settings.devVoice = sel.value; Store.touch(); Audio2.play("Приве'т!"); };
+    sel.onchange = () => { S.settings.devVoice = sel.value; Store.touch(); syncVoices(); Audio2.play("Приве'т!"); };
   };
   syncVoices();
+  document.addEventListener("tts-voices", syncVoices);
   const rb = $("#reset");
   rb.onclick = () => {
     if (rb.dataset.armed) { const keep = S.settings, name = S.name; S = DEFAULT_STATE(); S.settings = keep; S.name = name; Store.touch(); toast("Progreso reiniciado"); App.go("inicio"); return; }
     rb.dataset.armed = "1"; rb.textContent = "Toca otra vez para confirmar"; rb.classList.add("btn-bad");
     setTimeout(() => { if (rb.isConnected) { delete rb.dataset.armed; rb.textContent = "Reiniciar progreso"; rb.classList.remove("btn-bad"); } }, 4000);
   };
+  return {cleanup: () => document.removeEventListener("tts-voices", syncVoices)};
 }};
 
 /* ---------- Arranque ---------- */
